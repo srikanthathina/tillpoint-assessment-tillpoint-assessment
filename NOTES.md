@@ -102,4 +102,4 @@ No unrelated issues investigated. Report 2 remains unfixed as described above.
 
 ## Session logs
 
-Used Copilot SDK in VS Code. This chat's session export has not yet been added to `session_logs/`; add the full export before submitting.
+Used Copilot SDK in VS Code. `session_logs/copilot_sdk_context_2026-11-21.json` contains the available session-context transcript and tool-call records; the personal tracking URL and private session identifiers are redacted. The context tool marked its transcript as truncated and the current turn as in progress; no native raw-export tool was available.
