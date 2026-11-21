@@ -12,14 +12,23 @@ def day_bounds_utc(day, utc_offset_minutes=0):
 
 
 def daily_sales(conn, day, utc_offset_minutes=0):
-    """Money received on one shop-local day, and how many orders it came from."""
+    """Cash movements on a shop-local day: captures less refunds, excluding non-cash events."""
     start, end = day_bounds_utc(day, utc_offset_minutes)
     row = conn.execute(
-        "SELECT COALESCE(SUM(amount_cents), 0) AS revenue, COUNT(DISTINCT order_id) AS orders"
+        "SELECT COALESCE(SUM(CASE WHEN movement_cents > 0 THEN movement_cents ELSE 0 END), 0) AS captured,"
+        " COALESCE(SUM(CASE WHEN movement_cents < 0 THEN -movement_cents ELSE 0 END), 0) AS refunded,"
+        " COALESCE(SUM(movement_cents), 0) AS revenue,"
+        " COUNT(DISTINCT CASE WHEN movement_cents != 0 THEN order_id END) AS orders"
         " FROM payments WHERE received_at >= ? AND received_at < ?",
         (start, end),
     ).fetchone()
-    return {"day": day, "revenue_cents": row["revenue"], "orders": row["orders"]}
+    return {
+        "day": day,
+        "captured_cents": row["captured"],
+        "refunded_cents": row["refunded"],
+        "revenue_cents": row["revenue"],
+        "orders": row["orders"],
+    }
 
 
 def top_products(conn, limit=5):

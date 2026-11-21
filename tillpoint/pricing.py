@@ -9,14 +9,31 @@ class CouponRejected(Exception):
 
 
 def subtotal(lines):
-    """lines: iterable of (unit_price_cents, qty)."""
-    return sum(price * qty for price, qty in lines)
+    """lines: iterable of (unit_price_cents, qty[, taxable])."""
+    return sum(price * qty for price, qty, _ in _normalize_lines(lines))
+
+
+def _normalize_lines(lines):
+    normalized = []
+    for line in lines:
+        parts = tuple(line)
+        if len(parts) == 2:
+            price, qty = parts
+            taxable = True
+        elif len(parts) == 3:
+            price, qty, taxable = parts
+        else:
+            raise ValueError("each line must contain price, quantity, and optional taxable flag")
+        normalized.append((price, qty, bool(taxable)))
+    return normalized
 
 
 def discount_for(coupon, subtotal_cents):
     """Discount in cents for a coupon row (or None) against a subtotal. Never more than the subtotal."""
     if coupon is None:
         return 0
+    if coupon["value"] < 0:
+        raise CouponRejected(f"{coupon['code']} has an invalid negative value")
     if subtotal_cents < coupon["min_subtotal_cents"]:
         raise CouponRejected(f"{coupon['code']} needs a subtotal of at least {coupon['min_subtotal_cents']}")
     if coupon["max_uses"] is not None and coupon["uses"] >= coupon["max_uses"]:
@@ -40,12 +57,17 @@ def round_half_up(numerator, denominator):
 
 def price_order(lines, region, coupon=None):
     """Return dict(subtotal_cents, discount_cents, tax_cents, total_cents)."""
-    sub = subtotal(lines)
+    normalized = _normalize_lines(lines)
+    sub = sum(price * qty for price, qty, _ in normalized)
+    taxable_subtotal = sum(price * qty for price, qty, taxable in normalized if taxable)
     discount = discount_for(coupon, sub)
-    tax = tax_for(max(sub - discount, 0), region)
+    taxable_discount = round_half_up(discount * taxable_subtotal, sub) if sub else 0
+    taxable_after_discount = max(taxable_subtotal - taxable_discount, 0)
+    tax = tax_for(taxable_after_discount, region)
     return {
         "subtotal_cents": sub,
         "discount_cents": discount,
+        "taxable_subtotal_cents": taxable_after_discount,
         "tax_cents": tax,
         "total_cents": sub - discount + tax,
     }

@@ -18,23 +18,24 @@ class Product:
     name: str
     price_cents: int
     stock: int
+    taxable: bool
 
 
 class Catalog:
     def __init__(self, conn):
         self.conn = conn
 
-    def add_product(self, sku, name, price_cents, stock=0):
+    def add_product(self, sku, name, price_cents, stock=0, taxable=True):
         self.conn.execute(
-            "INSERT INTO products (sku, name, price_cents, stock) VALUES (?, ?, ?, ?)",
-            (sku, name, price_cents, stock),
+            "INSERT INTO products (sku, name, price_cents, stock, taxable) VALUES (?, ?, ?, ?, ?)",
+            (sku, name, price_cents, stock, int(taxable)),
         )
 
     def get_product(self, sku):
         row = self.conn.execute("SELECT * FROM products WHERE sku = ?", (sku,)).fetchone()
         if row is None:
             raise UnknownProduct(sku)
-        return Product(row["sku"], row["name"], row["price_cents"], row["stock"])
+        return Product(row["sku"], row["name"], row["price_cents"], row["stock"], bool(row["taxable"]))
 
     def update_price(self, sku, price_cents):
         if price_cents < 0:
