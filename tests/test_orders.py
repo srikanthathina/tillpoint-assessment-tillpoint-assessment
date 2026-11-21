@@ -1,3 +1,6 @@
+import os
+import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 
@@ -36,6 +39,61 @@ class OrderDeskTest(unittest.TestCase):
         with self.assertRaises(OutOfStock):
             self.app.orders.create("ana", [("TEE", 4)])
         self.assertEqual(self.app.catalog.get_product("TEE").stock, 3)
+
+    def test_concurrent_orders_do_not_oversell_stale_stock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "orders.sqlite")
+            seed_conn = db.connect(path)
+            App(seed_conn).catalog.add_product("LOW", "Low stock", 500, stock=1)
+            seed_conn.close()
+
+            barrier = threading.Barrier(2)
+            outcomes = []
+            observed_stock = []
+            errors = []
+
+            def create_order(customer):
+                conn = None
+                app = None
+                try:
+                    conn = db.connect(path)
+                    app = App(conn)
+                    app.catalog.get_product("LOW")
+                    barrier.wait(timeout=5)
+                    app.orders.create(customer, [("LOW", 1)])
+                    outcomes.append("created")
+                except OutOfStock:
+                    outcomes.append("out_of_stock")
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    if app is not None:
+                        try:
+                            observed_stock.append(app.catalog.get_product("LOW").stock)
+                        except Exception as error:
+                            errors.append(error)
+                    if conn is not None:
+                        conn.close()
+
+            threads = [
+                threading.Thread(target=create_order, args=("ana",)),
+                threading.Thread(target=create_order, args=("ben",)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertCountEqual(outcomes, ["created", "out_of_stock"])
+            self.assertEqual(observed_stock, [0, 0])
+
+            check_conn = db.connect(path)
+            self.assertEqual(check_conn.execute(
+                "SELECT stock FROM products WHERE sku = 'LOW'").fetchone()["stock"], 0)
+            self.assertEqual(check_conn.execute("SELECT COUNT(*) AS count FROM orders").fetchone()["count"], 1)
+            check_conn.close()
 
     def test_payment_marks_order_paid(self):
         order = self.app.orders.create("ana", [("MUG", 1)])
