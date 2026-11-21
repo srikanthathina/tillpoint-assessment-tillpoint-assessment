@@ -43,6 +43,24 @@ class OrderDeskTest(unittest.TestCase):
             "id": "evt_1", "type": "payment.succeeded", "order_id": order["id"], "amount_cents": 1200})
         self.assertEqual((status, payload["status"]), (200, "paid"))
 
+    def test_retried_payment_webhook_is_idempotent(self):
+        order = self.app.orders.create("ana", [("MUG", 1)])
+        event = {
+            "id": "evt_retry", "type": "payment.succeeded",
+            "order_id": order["id"], "amount_cents": 1200,
+        }
+
+        first_status, first_payload = self.app.handle("POST", "/webhooks/payments", event)
+        retry_status, retry_payload = self.app.handle("POST", "/webhooks/payments", event)
+
+        self.assertEqual((first_status, first_payload["status"]), (200, "paid"))
+        self.assertEqual((retry_status, retry_payload["status"]), (200, "paid"))
+        self.assertEqual(self.app.payments.paid_cents(order["id"]), 1200)
+        payment_count = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM payments WHERE event_id = ?", (event["id"],)
+        ).fetchone()["count"]
+        self.assertEqual(payment_count, 1)
+
     def test_cancel_paid_order_restocks(self):
         order = self.app.orders.create("ana", [("TEE", 2)])
         self.app.payments.handle_event(

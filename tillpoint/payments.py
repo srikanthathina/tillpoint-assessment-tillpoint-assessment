@@ -14,19 +14,35 @@ class Payments:
         """event: dict(id, type, order_id, amount_cents). Returns the order's status after the event."""
         if event.get("type") != "payment.succeeded":
             return None
+        existing_status = self._event_status(event["id"])
+        if existing_status is not None:
+            return existing_status
         order = self.conn.execute("SELECT * FROM orders WHERE id = ?", (event["order_id"],)).fetchone()
         if order is None:
             raise PaymentError(f"payment for unknown order {event['order_id']}")
         if order["status"] == "cancelled":
             raise PaymentError(f"order {order['id']} is cancelled")
-        self.conn.execute(
-            "INSERT INTO payments (order_id, event_id, amount_cents, received_at) VALUES (?, ?, ?, ?)",
+        cursor = self.conn.execute(
+            "INSERT INTO payments (order_id, event_id, amount_cents, received_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(event_id) DO NOTHING",
             (order["id"], event["id"], event["amount_cents"], db.to_iso(now or db.utcnow())),
         )
+        if cursor.rowcount == 0:
+            existing_status = self._event_status(event["id"])
+            if existing_status is None:
+                raise PaymentError(f"payment event {event['id']} was not recorded")
+            return existing_status
         if order["status"] == "pending" and self.paid_cents(order["id"]) >= order["total_cents"]:
             self.conn.execute("UPDATE orders SET status = 'paid' WHERE id = ?", (order["id"],))
             return "paid"
         return order["status"]
+
+    def _event_status(self, event_id):
+        row = self.conn.execute(
+            "SELECT o.status FROM payments p JOIN orders o ON o.id = p.order_id WHERE p.event_id = ?",
+            (event_id,),
+        ).fetchone()
+        return None if row is None else row["status"]
 
     def paid_cents(self, order_id):
         row = self.conn.execute(
