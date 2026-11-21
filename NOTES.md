@@ -4,33 +4,33 @@
 
 > Finance says that on some days the revenue in the daily report is higher than what the payment provider paid out, and a few orders show more money received than their total.
 
-**Status:** fixed
+**Status:** fixed for captured/refunded cash movements; provider fees and payout-batch reconciliation remain unavailable without provider settlement data.
 
-**What I saw:** A repeated successful webhook with the same provider event ID was inserted as another payment row. Since the payment and daily sales totals sum payment rows, retry deliveries could inflate both totals.
+**What I saw:** The old handler inserted every successful delivery, and the report summed all payment rows. A repeated event ID could therefore inflate both an order's paid amount and daily revenue. The old model also had no representation for refunds or non-cash payment states.
 
-**Root cause:** `handle_event` inserted every successful delivery without deduplicating by event ID, and the payments table did not enforce unique event IDs.
+**Root cause:** There was no unique event-ID constraint or cash-movement classification; the report treated every row as a positive receipt.
 
-**Fix and why:** Added a unique index on `payments.event_id` and made duplicate inserts a no-op. A repeated webhook returns successfully without counting its amount again. Distinct event IDs remain separate payments; their overpayment handling is described in Report 6.
+**Fix and why:** Added transactional, event-ID-idempotent payment processing and a signed movement amount. Captures are positive, refunds are negative on the refund event date, and pending/failed/voided/authorized events have zero movement. A stable `payment_ref` prevents a separate settled notification for an already captured payment from being counted twice. Legacy identical duplicate event rows are collapsed during migration; conflicting rows fail migration rather than being silently altered. The report now shows captured, refunded, and net movement totals. Provider fees are excluded because no payout-batch or fee fields exist in this integration.
 
-**How I verified it:** Added a retry test that sends the same event twice and checks both responses are HTTP 200, only one payment row exists, and the order's paid amount remains 1,200 cents. The full test suite passed.
+**How I verified it:** Tests cover duplicate webhook IDs, capture followed by settlement with the same `payment_ref`, pending/failed/voided events, and a partial refund plus its retry. The full suite passes.
 
-**Commits:** `7a43d8f`
+**Commits:** `7a43d8f`, `efd7a10`
 
 ## 2. Report
 
 > Products show as sold out, or nearly, while the shelf is full. Staff say it gets worse on days when many customers abandon checkout.
 
-**Status:** not fixed
+**Status:** fixed
 
-**What I saw:** Order creation reserves stock immediately. Cancelling an unpaid order does not release its reservation, and there is no expiration or abandoned-checkout cleanup.
+**What I saw:** Stock is reserved when an order is created. Previously, pending orders had no expiration and cancelling an unpaid order did not release its reservation.
 
-**Root cause:** There is no lifecycle policy or mechanism to release stock held by pending orders that customers never pay for.
+**Root cause:** There was no stale-checkout lifecycle, and cancellation only restored stock for paid orders.
 
-**Fix and why:** No fix was made. Choosing and implementing an order-expiration policy is still needed; without one, abandoned pending orders can continue to consume stock.
+**Fix and why:** Pending and partially paid checkouts expire after 30 minutes. Creating another order or reading a product/order expires stale checkouts and restores their stock and coupon use. Cancelling an unshipped order also releases its reservation, tracked with `stock_reserved` so repeated cancellation cannot release stock twice. Partial payments on expired/cancelled orders remain recorded as refund due.
 
-**How I verified it:** Inspected order creation and cancellation behavior. I did not add an expiration test because no expiration behavior was implemented.
+**How I verified it:** Tests cover exact timeout boundaries, expiry through product reads, pending cancellation, repeated cancellation, coupon-use restoration, and a late payment after expiry. The concurrency test also confirms only one order can reserve a single remaining unit.
 
-**Commits:** none
+**Commits:** `efd7a10`
 
 ## 3. Report
 
@@ -38,15 +38,15 @@
 
 **Status:** fixed
 
-**What I saw:** `price_order` calculated tax from the full subtotal, then subtracted the coupon discount only when calculating the total.
+**What I saw:** Tax used the full subtotal before the coupon was subtracted.
 
-**Root cause:** The coupon discount was not applied to the taxable amount.
+**Root cause:** Coupon reductions were not applied to the taxable base.
 
-**Fix and why:** Tax is now calculated from `max(subtotal - discount, 0)`. This taxes the discounted price and ensures the taxable base cannot be negative.
+**Fix and why:** Tax now applies after the coupon. Product taxability is explicit, defaulting to taxable; discounts are allocated proportionally across taxable and exempt line values. The taxable base is floored at zero, and rounding remains half up.
 
-**How I verified it:** A CA order for a 1,200-cent item with a 10% coupon failed before the fix (87 cents tax instead of 78). It passes afterward with a 1,158-cent total. The full test suite passed.
+**How I verified it:** Tests cover the original CA coupon case, mixed taxable/exempt products, a 100% coupon, a fixed coupon greater than the subtotal, and an exact half-cent tax result. The full suite passes.
 
-**Commits:** `a02d5e1`
+**Commits:** `a02d5e1`, `efd7a10`
 
 ## 4. Report
 
@@ -54,15 +54,15 @@
 
 **Status:** fixed
 
-**What I saw:** `day_bounds_utc` added the shop offset to local midnight. For a positive offset, this moved the UTC window later instead of earlier.
+**What I saw:** The UTC day boundary added the shop offset, shifting the requested local day later.
 
-**Root cause:** UTC time for local midnight is local midnight minus the UTC offset; the sign was reversed.
+**Root cause:** UTC local-midnight conversion needs to subtract a positive offset.
 
-**Fix and why:** The report now subtracts `utc_offset_minutes` when calculating the UTC start of the local day. The end remains one day after that start.
+**Fix and why:** `day_bounds_utc` subtracts `utc_offset_minutes` and uses a half-open interval `[start, end)`.
 
-**How I verified it:** Added a test for a 330-minute offset that distinguishes a local-morning payment from a payment just after the following local midnight. It failed before the fix and passed afterward. The full test suite passed.
+**How I verified it:** Tests check IST local midnight, 05:29, and the following local midnight boundary. The full suite passes.
 
-**Commits:** `6e55167`
+**Commits:** `6e55167`, `efd7a10`
 
 ## 5. Report
 
@@ -70,36 +70,36 @@
 
 **Status:** fixed
 
-**What I saw:** `Orders.create` already takes a SQLite `BEGIN IMMEDIATE` lock, but each worker's catalog cache could retain a stale stock count. `Catalog.reserve` checked that cached count, then decremented the database stock unconditionally.
+**What I saw:** Each worker's catalog cache could hold stale stock, and the old reserve path decremented unconditionally after checking that cached value.
 
-**Root cause:** The stock sufficiency check and decrement were not one conditional database operation, and worker-local cached stock could be stale after another worker committed.
+**Root cause:** The sufficiency check and decrement were separate operations using worker-local stock.
 
-**Fix and why:** Removed the per-process catalog cache and made reservation a conditional SQL update (`stock >= qty`). An insufficient-stock result uses the current database value and raises `OutOfStock`; the surrounding order transaction rolls back. The existing write lock remains in place.
+**Fix and why:** Removed the process-local cache and made reservation a conditional SQL update (`stock >= qty`). Order creation uses `BEGIN IMMEDIATE`, and failed reservations roll back the entire order.
 
-**How I verified it:** A file-backed SQLite test starts two workers with one unit in stock. Before the fix both orders succeeded; afterward exactly one succeeds, the other gets `OutOfStock`, stock remains zero, and only one order exists. All tests passed, and the concurrency test passed five repeated runs.
+**How I verified it:** A file-backed two-worker test starts both workers with one unit in stock. Exactly one order succeeds, the other gets `OutOfStock`, stock remains zero, and only one order is created. The concurrency test also passed five repeated runs.
 
-**Commits:** `8d61cdf`
+**Commits:** `8d61cdf`, `efd7a10`
 
 ## 6. Open question
 
 > Open question from support, no single right answer: sometimes a customer really does pay twice for one order (two separate payments, not a retry of the same one). Today the system records both and says nothing. Decide what should happen, build the smallest version of your decision, and explain what it costs in `NOTES.md`.
 
-**My decision:** Accept and record each real successful payment. If the total exceeds the order total, report the excess as `overpaid_cents` in the successful webhook response.
+**My decision:** Record real separate captures, apply partial payments to the balance, and flag amounts above the order total as overpayment credit. Do not reject a webhook for money the provider has already captured.
 
-**Why:** Rejecting a webhook cannot reverse a charge the provider already accepted. It could also cause retries and leave the payment record incomplete. Keeping the full payment trail and explicitly flagging the excess is safer.
+**Why:** Rejecting an already captured payment could cause retries and hide cash that actually moved. Keeping it in the ledger preserves the audit trail.
 
-**What it costs:** `overpaid_cents` is derived from recorded payments and the order total; it is not a separate credit ledger. Refunds or applying the credit to a future order are not automated, so staff must reconcile it. Daily sales still counts the full cash received; accounting must distinguish the overpayment from earned sales.
+**What it costs:** Refunds are recorded and reported but are not initiated automatically. Overpayment and refund-due amounts are derived from the movement ledger rather than a separate credit/refund workflow. Staff must reconcile those balances. Daily sales reports cash movements, not revenue net of provider fees.
 
-**What I built:** Added `Payments.overpaid_cents` and included that amount in successful payment webhook responses. The order remains paid and the extra payment remains recorded; a retry with the same event ID is still idempotent.
+**What I built:** Webhooks are idempotent by event ID. Partial payments set `partially_paid`; captures and refunds update the net paid balance, order status, balance due, overpayment credit, and refund due. `payment_ref` correlates capture and settlement notifications. Full refunds release unshipped stock; a later capture does not reopen a refunded, cancelled, or expired order.
 
-**How I verified it:** Added a test that submits two successful payments with different event IDs for a 1,200-cent order. Both return HTTP 200, the second reports 1,200 cents overpaid, and the recorded paid amount is 2,400 cents. The full suite passed.
+**How I verified it:** Tests cover partial payments, distinct payments that overpay, same-ID retries, capture/settlement deduplication, partial and full refunds, excessive refunds, and late payments after expiry. The full suite passes.
 
-**Commits:** `bf6dddd`
+**Commits:** `bf6dddd`, `efd7a10`
 
 ## Other things I noticed
 
-No unrelated issues investigated. Report 2 remains unfixed as described above.
+No unrelated issues investigated. Net settlement after provider fees cannot be calculated until the provider integration supplies payout-batch and fee data.
 
 ## Session logs
 
-Used Copilot SDK in VS Code. `session_logs/copilot_sdk_context_2026-11-21.json` contains the available session-context transcript and tool-call records; the personal tracking URL and private session identifiers are redacted. The context tool marked its transcript as truncated and the current turn as in progress; no native raw-export tool was available.
+Used Copilot SDK in VS Code. `session_logs/copilot_sdk_context_2026-11-21.json` is a redacted bounded context export, not a complete raw session export. The context tool marked it truncated, and it predates the final audit changes. A full export of the complete conversation is still needed before submission.
