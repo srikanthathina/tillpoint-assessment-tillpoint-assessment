@@ -76,6 +76,22 @@ class OrderDeskTest(unittest.TestCase):
         self.assertEqual(reports.daily_sales(self.conn, "2025-03-10"),
                          {"day": "2025-03-10", "revenue_cents": 1200, "orders": 1})
 
+    def test_daily_sales_uses_positive_utc_offset(self):
+        morning_order = self.app.orders.create("ana", [("MUG", 1)])
+        next_day_order = self.app.orders.create("ana", [("TEE", 1)])
+        self.app.payments.handle_event(
+            {"id": "evt_utc_morning", "type": "payment.succeeded",
+             "order_id": morning_order["id"], "amount_cents": 1200},
+            now=datetime(2025, 3, 9, 19, 0, tzinfo=timezone.utc))
+        self.app.payments.handle_event(
+            {"id": "evt_utc_evening", "type": "payment.succeeded",
+             "order_id": next_day_order["id"], "amount_cents": 2500},
+            now=datetime(2025, 3, 10, 19, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(
+            reports.daily_sales(self.conn, "2025-03-10", utc_offset_minutes=330),
+            {"day": "2025-03-10", "revenue_cents": 1200, "orders": 1})
+
     def test_price_change(self):
         self.app.handle("PUT", "/products/MUG", {"price_cents": 1500})
         self.assertEqual(self.app.catalog.get_product("MUG").price_cents, 1500)
