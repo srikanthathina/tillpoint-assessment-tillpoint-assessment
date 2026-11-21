@@ -119,6 +119,20 @@ class OrderDeskTest(unittest.TestCase):
         ).fetchone()["count"]
         self.assertEqual(payment_count, 1)
 
+    def test_separate_payment_is_reported_as_overpayment_credit(self):
+        order = self.app.orders.create("ana", [("MUG", 1)])
+        first_status, first_payload = self.app.handle("POST", "/webhooks/payments", {
+            "id": "evt_first_payment", "type": "payment.succeeded",
+            "order_id": order["id"], "amount_cents": 1200})
+        second_status, second_payload = self.app.handle("POST", "/webhooks/payments", {
+            "id": "evt_second_payment", "type": "payment.succeeded",
+            "order_id": order["id"], "amount_cents": 1200})
+
+        self.assertEqual((first_status, first_payload["status"]), (200, "paid"))
+        self.assertEqual((second_status, second_payload["status"]), (200, "paid"))
+        self.assertEqual(second_payload.get("overpaid_cents"), 1200)
+        self.assertEqual(self.app.payments.paid_cents(order["id"]), 2400)
+
     def test_cancel_paid_order_restocks(self):
         order = self.app.orders.create("ana", [("TEE", 2)])
         self.app.payments.handle_event(

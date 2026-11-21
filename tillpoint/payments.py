@@ -49,3 +49,11 @@ class Payments:
             "SELECT COALESCE(SUM(amount_cents), 0) AS paid FROM payments WHERE order_id = ?", (order_id,)
         ).fetchone()
         return row["paid"]
+
+    def overpaid_cents(self, order_id):
+        order = self.conn.execute(
+            "SELECT total_cents FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if order is None:
+            raise PaymentError(f"payment for unknown order {order_id}")
+        return max(self.paid_cents(order_id) - order["total_cents"], 0)
